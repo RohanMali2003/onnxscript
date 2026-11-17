@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import onnx_ir as ir
 
 from onnxscript.rewriter._rewrite_rule import RewriteRule, RewriteRuleSet
@@ -17,14 +18,35 @@ def cast_constant_of_shape(op, shape, scalar, dtype):
 
 
 def fused_cast_constant_of_shape(op, shape: ir.Value, scalar: ir.Attr, dtype: ir.Attr, **_):
-    # Cast scalar (a TensorProto attribute) to the specified dtype
-    scalar_value = scalar.value.numpy().item()
-    cast_value = ir.tensor([scalar_value], dtype=ir.DataType(dtype.as_int()))
+    # Cast scalar (a TensorProto attribute) to the specified dtype. Convert the array, not a
+    # Python scalar, so that values outside the target range wrap like the Cast op instead of
+    # raising OverflowError.
+    to_dtype = ir.DataType(dtype.as_int())
+    with np.errstate(invalid="ignore"):
+        cast_array = scalar.as_tensor().numpy().astype(to_dtype.numpy()).reshape(1)
+    cast_value = ir.tensor(cast_array, dtype=to_dtype)
     return op.ConstantOfShape(shape, value=cast_value)
 
 
+def check_cast_constant_of_shape(context, shape, scalar, dtype, **_) -> bool:
+    del context, shape
+    if dtype.is_ref() or scalar.is_ref():
+        return False
+    if dtype.type != ir.AttributeType.INT:
+        return False
+    to_dtype = dtype.as_int()
+    if to_dtype in (ir.DataType.UNDEFINED, ir.DataType.STRING):
+        return False
+    if scalar.type != ir.AttributeType.TENSOR or scalar.value is None:
+        return False
+    scalar_tensor = scalar.as_tensor()
+    if scalar_tensor.size != 1 or scalar_tensor.dtype == ir.DataType.STRING:
+        return False
+    return True
+
+
 def cast_constant_of_shape_without_value(op, shape, dtype):
-    constant = op.ConstantOfShape(shape)
+    constant = op.ConstantOfShape(shape, _allow_other_attributes=False)
     return op.Cast(constant, to=dtype)
 
 
@@ -33,10 +55,28 @@ def fused_cast_constant_of_shape_without_value(op, shape, dtype, **_):
     return op.ConstantOfShape(shape, value=zero)
 
 
-cast_constant_of_shape_rule = RewriteRule(cast_constant_of_shape, fused_cast_constant_of_shape)
+def check_cast_constant_of_shape_without_value(context, shape, dtype, **_) -> bool:
+    del context, shape
+    if dtype.is_ref():
+        return False
+    if dtype.type != ir.AttributeType.INT:
+        return False
+    to_dtype = dtype.as_int()
+    if to_dtype in (ir.DataType.UNDEFINED, ir.DataType.STRING):
+        return False
+    return True
+
+
+cast_constant_of_shape_rule = RewriteRule(
+    cast_constant_of_shape,
+    fused_cast_constant_of_shape,
+    check_cast_constant_of_shape,
+)
 
 cast_constant_of_shape_without_value_rule = RewriteRule(
-    cast_constant_of_shape_without_value, fused_cast_constant_of_shape_without_value
+    cast_constant_of_shape_without_value,
+    fused_cast_constant_of_shape_without_value,
+    check_cast_constant_of_shape_without_value,
 )
 
 rules = RewriteRuleSet(

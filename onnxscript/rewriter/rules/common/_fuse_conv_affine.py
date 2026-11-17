@@ -27,14 +27,26 @@ class _ConvAffineFusionBase(pattern.RewriteRuleClassBase):
         conv_out: ir.Value,
     ) -> MatchResult:
         check_result = MatchResult()
-        if get_const_value(w) is None:
-            return check_result.fail("The weight of Conv should be constant")
-        if get_const_value(b) is None:
-            return check_result.fail("The bias of Conv should be constant")
         if get_singleton_value(scale) is None:
             return check_result.fail("Operand for Mul should be constant scalar value")
         if get_singleton_value(offset) is None:
             return check_result.fail("Operand for Add should be constant scalar value")
+        w_val = get_const_value(w)
+        if w_val is None:
+            return check_result.fail("The weight of Conv should be constant")
+        b_val = get_const_value(b)
+        if b_val is None:
+            return check_result.fail("The bias of Conv should be constant")
+        w_shape = w_val.shape
+        b_shape = b_val.shape
+        if len(w_shape) < 3:
+            return check_result.fail("Conv weight tensor must have rank >= 3")
+        if len(b_shape) != 1:
+            return check_result.fail("Conv bias tensor must have rank 1")
+        if w_shape[0] != b_shape[0]:
+            return check_result.fail(
+                f"Conv weight output channels ({w_shape[0]}) does not match bias channels ({b_shape[0]})"
+            )
         return check_result
 
 
@@ -46,10 +58,53 @@ class AffineConvFusion(_ConvAffineFusionBase):
             x * scale + offset,
             w,
             b,
-            pads=[0, 0, 0, 0],
             _allow_other_attributes=True,
             _outputs=["conv_out"],
         )
+
+    def check(
+        self,
+        context,
+        x: ir.Value,
+        w: ir.Value,
+        b: ir.Value,
+        scale: ir.Value,
+        offset: ir.Value,
+        conv_out: ir.Value,
+    ) -> MatchResult:
+        check_result = MatchResult()
+        conv_node = conv_out.producer()
+        if conv_node is None:
+            return check_result.fail("Conv node not found")
+        pads_attr = conv_node.attributes.get("pads")
+        if pads_attr is not None:
+            if hasattr(pads_attr, "is_ref") and pads_attr.is_ref():
+                return check_result.fail(
+                    f"Conv 'pads' refers to reference attribute {pads_attr.ref_attr_name!r}"
+                )
+            try:
+                pads = list(pads_attr.as_ints())
+                if any(p != 0 for p in pads):
+                    return check_result.fail(f"Conv has non-zero pads: {pads}")
+            except (TypeError, ValueError, AttributeError):
+                return check_result.fail("Conv 'pads' attribute could not be read as integers")
+        auto_pad_attr = conv_node.attributes.get("auto_pad")
+        if auto_pad_attr is not None:
+            if hasattr(auto_pad_attr, "is_ref") and auto_pad_attr.is_ref():
+                return check_result.fail(
+                    f"Conv 'auto_pad' refers to reference attribute {auto_pad_attr.ref_attr_name!r}"
+                )
+            try:
+                auto_pad = auto_pad_attr.as_string()
+                if auto_pad not in {"NOTSET", "VALID"}:
+                    return check_result.fail(
+                        f"Conv 'auto_pad' {auto_pad!r} introduces padding"
+                    )
+            except (TypeError, ValueError, AttributeError):
+                return check_result.fail(
+                    "Conv 'auto_pad' attribute could not be read as string"
+                )
+        return super().check(context, x, w, b, scale, offset, conv_out)
 
     def rewrite(
         self,
@@ -65,9 +120,15 @@ class AffineConvFusion(_ConvAffineFusionBase):
         offset_value = offset.const_value.numpy()
         w_value = w.const_value.numpy()
         b_value = b.const_value.numpy()
-        scaled_w_value = op.initializer(ir.tensor(w_value * scale_value), w.name + "_scaled")
+        scaled_w_value = op.initializer(
+            ir.tensor((w_value * scale_value).astype(w_value.dtype)),
+            w.name + "_scaled",
+        )
+        axes = tuple(range(1, w_value.ndim))
         offset_bias = ir.tensor(
-            b_value + np.sum(w_value * offset_value, axis=(1, 2, 3), keepdims=False)
+            (b_value + np.sum(w_value * offset_value, axis=axes, keepdims=False)).astype(
+                b_value.dtype
+            )
         )
         offset_bias = op.initializer(offset_bias, b.name + "_offset")
         conv_attributes = conv_out.producer().attributes
@@ -97,8 +158,11 @@ class ConvAffineFusion(_ConvAffineFusionBase):
         offset_value = offset.const_value.numpy()
         w_value = w.const_value.numpy()
         b_value = b.const_value.numpy()
-        scaled_w_weight = op.initializer(ir.tensor(w_value * scale_value), w.name + "_scaled")
-        offset_bias = ir.tensor(b_value * scale_value + offset_value)
+        scaled_w_weight = op.initializer(
+            ir.tensor((w_value * scale_value).astype(w_value.dtype)),
+            w.name + "_scaled",
+        )
+        offset_bias = ir.tensor((b_value * scale_value + offset_value).astype(b_value.dtype))
         offset_bias = op.initializer(offset_bias, b.name + "_offset")
         conv_attributes = conv_out.producer().attributes
         return op.Conv(x, scaled_w_weight, offset_bias, **conv_attributes)
