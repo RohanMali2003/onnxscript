@@ -93,22 +93,39 @@ class _FuseMinMaxBase(RewriteRuleClassBase, abc.ABC):
         first_node = out1.producer()
         second_node = out2.producer()
 
+        const_inputs = first_node.inputs[1:] + second_node.inputs[1:]
+        if not const_inputs:
+            return check_result.fail("No constant inputs found to fuse.")
+
+        # Clip fusion requires bounds from both operations (min and max)
+        if self.need_scalars and (len(first_node.inputs) <= 1 or len(second_node.inputs) <= 1):
+            return check_result.fail(
+                "Clip fusion requires constant bounds on both operations."
+            )
+
         # Ensure all inputs except the first are constants
-        for input_ in first_node.inputs[1:] + second_node.inputs[1:]:
-            if ir.convenience.get_const_tensor(input_) is None:
+        for input_ in const_inputs:
+            const_tensor = ir.convenience.get_const_tensor(input_)
+            if const_tensor is None:
                 return check_result.fail(f"{input_.name} is not a constant.")
 
             # If scalars are required (Clip fusion), enforce scalar-ness
-            if self.need_scalars and not self._is_scalar(input_.const_value.numpy()):
+            if self.need_scalars and not self._is_scalar(const_tensor.numpy()):
                 return check_result.fail(f"{input_.name} is not a scalar.")
 
-        if self.need_scalars and self.check_bounds:
-            # For Clip fusion in the case of Max(Min(X, upper_bound), lower_bound): check that lower_bound <= upper_bound
+        if self.need_scalars:
             lower_bound, upper_bound = self.compute_constants(first_node, second_node)
-            if lower_bound[0].numpy() > upper_bound[0].numpy():
+            lb_val = lower_bound[0].numpy()
+            ub_val = upper_bound[0].numpy()
+            if np.isnan(lb_val) or np.isnan(ub_val):
                 return check_result.fail(
-                    f"Invalid bounds: lower bound ({lower_bound[0].numpy()}) is greater "
-                    f"than upper bound ({upper_bound[0].numpy()})."
+                    f"Invalid bounds: NaN bound encountered (lower bound: {lb_val}, upper bound: {ub_val})."
+                )
+            if self.check_bounds and lb_val > ub_val:
+                # For Clip fusion in the case of Max(Min(X, upper_bound), lower_bound): check that lower_bound <= upper_bound
+                return check_result.fail(
+                    f"Invalid bounds: lower bound ({lb_val}) is greater "
+                    f"than upper bound ({ub_val})."
                 )
 
         return check_result
@@ -130,7 +147,7 @@ class FuseSuccessiveMin(_FuseMinMaxBase):
         input_name: str = "",
     ) -> list[tuple[ir.Tensor, str]]:
         inputs = first_node.inputs[1:] + second_node.inputs[1:]
-        values = [input_.const_value.numpy() for input_ in inputs]
+        values = [ir.convenience.get_const_tensor(input_).numpy() for input_ in inputs]
         return [(ir.tensor(functools.reduce(np.minimum, values)), f"{input_name}_min")]
 
     def pattern(self, op, x):
@@ -157,7 +174,7 @@ class FuseSuccessiveMax(_FuseMinMaxBase):
         input_name: str = "",
     ) -> list[tuple[ir.Tensor, str]]:
         inputs = first_node.inputs[1:] + second_node.inputs[1:]
-        values = [input_.const_value.numpy() for input_ in inputs]
+        values = [ir.convenience.get_const_tensor(input_).numpy() for input_ in inputs]
         return [(ir.tensor(functools.reduce(np.maximum, values)), f"{input_name}_max")]
 
     def pattern(self, op, x):
@@ -187,8 +204,22 @@ class FuseMaxMinToClip(_FuseMinMaxBase):
         second_node: ir.Node,
         input_name: str = "",
     ) -> list[tuple[ir.Tensor, str]]:
-        lower_bound = np.max([input_.const_value.numpy() for input_ in first_node.inputs[1:]])
-        upper_bound = np.min([input_.const_value.numpy() for input_ in second_node.inputs[1:]])
+        lower_bound = np.squeeze(
+            np.max(
+                [
+                    ir.convenience.get_const_tensor(input_).numpy()
+                    for input_ in first_node.inputs[1:]
+                ]
+            )
+        )
+        upper_bound = np.squeeze(
+            np.min(
+                [
+                    ir.convenience.get_const_tensor(input_).numpy()
+                    for input_ in second_node.inputs[1:]
+                ]
+            )
+        )
         return [
             (ir.tensor(lower_bound), f"{input_name}_min"),
             (ir.tensor(upper_bound), f"{input_name}_max"),
@@ -223,8 +254,22 @@ class FuseMinMaxToClip(_FuseMinMaxBase):
         second_node: ir.Node,
         input_name: str = "",
     ) -> list[tuple[ir.Tensor, str]]:
-        upper_bound = np.min([input_.const_value.numpy() for input_ in first_node.inputs[1:]])
-        lower_bound = np.max([input_.const_value.numpy() for input_ in second_node.inputs[1:]])
+        upper_bound = np.squeeze(
+            np.min(
+                [
+                    ir.convenience.get_const_tensor(input_).numpy()
+                    for input_ in first_node.inputs[1:]
+                ]
+            )
+        )
+        lower_bound = np.squeeze(
+            np.max(
+                [
+                    ir.convenience.get_const_tensor(input_).numpy()
+                    for input_ in second_node.inputs[1:]
+                ]
+            )
+        )
         return [
             (ir.tensor(lower_bound), f"{input_name}_min"),
             (ir.tensor(upper_bound), f"{input_name}_max"),
